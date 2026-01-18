@@ -1,80 +1,87 @@
-from rest_framework import generics, status
+import requests
+from django.conf import settings
+from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth import get_user_model
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from .serializers import UserRegisterSerializer, UserLoginSerializer, UserMeSerializer
 
 
-UserProfile = get_user_model()
+def crud_url(path: str) -> str:
+    return f"{settings.CRUD_BASE_URL.rstrip('/')}{path}"
 
 
-class RegisterView(generics.CreateAPIView):
-    """
-    Регистрация + выдача JWT
-    """
-    serializer_class = UserRegisterSerializer
+class RegisterView(APIView):
     permission_classes = [AllowAny]
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
+    def post(self, request):
+        serializer = UserRegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
 
-        refresh = RefreshToken.for_user(user)
+        payload = dict(serializer.validated_data)
+        payload.pop("password_confirm", None)
+
+        # CRUD должен создать пользователя в своей БД
+        try:
+            r = requests.post(crud_url("/api/auth/register/"), json=payload, timeout=8)
+        except requests.RequestException:
+            return Response({"detail": "CRUD сервис недоступен"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if r.status_code != 201:
+            # Пробрасываем ошибку CRUD как есть
+            try:
+                return Response(r.json(), status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                return Response({"detail": "Ошибка регистрации в CRUD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = r.json()
+        user_id = user.get("id")
+
+        refresh = RefreshToken()
+        refresh["user_id"] = user_id
+        refresh["username"] = user.get("username")
 
         return Response({
-            'message': 'Регистрация успешна',
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'age': user.age,
-                'phone_number': str(user.phone_number) if user.phone_number else None,
-                'status': user.status,
-            },
-            'access': str(refresh.access_token),
-            'refresh': str(refresh),
+            "message": "Регистрация успешна",
+            "user": user,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
         }, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
-    """
-    Логин + JWT
-    """
     permission_classes = [AllowAny]
 
     def post(self, request):
         serializer = UserLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.validated_data
 
-        # Генерируем токены
-        refresh = RefreshToken.for_user(user)
+        try:
+            r = requests.post(crud_url("/api/auth/check/"), json=serializer.validated_data, timeout=8)
+        except requests.RequestException:
+            return Response({"detail": "CRUD сервис недоступен"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if r.status_code != 200:
+            return Response({"detail": "Неверный логин или пароль"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = r.json()
+        user_id = user.get("id")
+
+        refresh = RefreshToken()
+        refresh["user_id"] = user_id
+        refresh["username"] = user.get("username")
+
         return Response({
-            'user': {
-                'id': user.id,
-                'username': user.username,
-                'email': user.email,
-                'first_name': user.first_name,
-                'last_name': user.last_name,
-                'age': user.age,
-                'phone_number': str(user.phone_number) if user.phone_number else None,
-                'status': user.status,
-            },
-            'access': str(refresh.access_token),
-            'refresh': str(refresh),
+            "user": user,
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
         }, status=status.HTTP_200_OK)
 
 
 class LogoutView(APIView):
-    """
-    Logout (blacklist refresh token)
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -84,23 +91,33 @@ class LogoutView(APIView):
         try:
             token = RefreshToken(refresh_token)
             token.blacklist()
-            return Response(
-                {"message": "Выход выполнен успешно"},
-                status=status.HTTP_205_RESET_CONTENT
-            )
+            return Response({"message": "Выход выполнен успешно"}, status=status.HTTP_205_RESET_CONTENT)
         except Exception:
-            return Response(
-                {"detail": "Неверный или уже использованный refresh токен"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"detail": "Неверный или уже использованный refresh токен"}, status=status.HTTP_400_BAD_REQUEST)
 
 
-class UserMeView(generics.RetrieveAPIView):
+class UserMeView(APIView):
     """
-    Получение информации о текущем пользователе
+    Берем профиль из CRUD по токену
     """
-    serializer_class = UserMeSerializer
     permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
 
-    def get_object(self):
-        return self.request.user
+    def get(self, request):
+        auth_header = request.headers.get("Authorization", "")
+        try:
+            r = requests.get(
+                crud_url("/api/auth/me/"),
+                headers={"Authorization": auth_header},
+                timeout=8
+            )
+        except requests.RequestException:
+            return Response({"detail": "CRUD сервис недоступен"}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        if r.status_code != 200:
+            return Response({"detail": "Не удалось получить профиль"}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = r.json()
+        out = UserMeSerializer(data=data)
+        out.is_valid(raise_exception=True)
+        return Response(out.validated_data, status=status.HTTP_200_OK)
